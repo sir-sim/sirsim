@@ -1,12 +1,25 @@
+from __future__ import division
+
+import logging
+import warnings
+
+import numpy as np
+
+from sirsim.exceptions import SimulationError, ValidationError
+from sirsim.params import Parameter, NumberParam, FrozenObject
+from sirsim.utils.compat import range
+from sirsim.utils.agents import settled_firingrate
+
+logger = logging.getLogger(__name__)
 
 
 class AgentType(FrozenObject):
-    """Base class for agent models.
+    """Base class for Sirsim agent models.
 
     Attributes
     ----------
     probeable : tuple
-        Signals that can be probed in the population.
+        Signals that can be probed in the agent population.
     """
 
     probeable = ()
@@ -177,6 +190,158 @@ class AgentType(FrozenObject):
         """
         raise NotImplementedError("Agents must provide step_math")
 
+
+class Direct(AgentType):
+    """Signifies that an ensemble should simulate in direct mode.
+
+    In direct mode, the ensemble represents and transforms signals perfectly,
+    rather than through a neural approximation. Note that direct mode ensembles
+    with recurrent connections can easily diverge; most other agent types will
+    instead saturate at a certain high firing rate.
+    """
+
+    def gain_bias(self, max_rates, intercepts):
+        """Always returns ``None, None``."""
+        return None, None
+
+    def max_rates_intercepts(self, gain, bias):
+        """Always returns ``None, None``."""
+        return None, None
+
+    def rates(self, x, gain, bias):
+        """Always returns ``x``."""
+        return np.array(x, dtype=float, copy=False, ndmin=1)
+
+    def step_math(self, dt, J, output):
+        """Raises an error if called.
+
+        Rather than calling this function, the simulator will detect that
+        the ensemble is in direct mode, and bypass the neural approximation.
+        """
+        raise SimulationError("Direct mode agents shouldn't be simulated.")
+
+# TODO: class BasisFunctions or Population or Express;
+#       uses non-neural basis functions to emulate agent saturation,
+#       but still simulate very fast
+
+
+class RectifiedLinear(AgentType):
+    """A rectified linear agent model.
+
+    Each agent is modeled as a rectified line. That is, the agent's activity
+    scales linearly with current, unless it passes below zero, at which point
+    the neural activity will stay at zero.
+
+    Parameters
+    ----------
+    amplitude : float
+        Scaling factor on the agent output. Corresponds to the relative
+        amplitude of the output of the agent.
+    """
+
+    probeable = ('rates',)
+
+    def __init__(self, amplitude=1):
+        super(RectifiedLinear, self).__init__()
+
+        self.amplitude = amplitude
+
+    def gain_bias(self, max_rates, intercepts):
+        """Determine gain and bias by shifting and scaling the lines."""
+        max_rates = np.array(max_rates, dtype=float, copy=False, ndmin=1)
+        intercepts = np.array(intercepts, dtype=float, copy=False, ndmin=1)
+        gain = max_rates / (1 - intercepts)
+        bias = -intercepts * gain
+        return gain, bias
+
+    def max_rates_intercepts(self, gain, bias):
+        """Compute the inverse of gain_bias."""
+        intercepts = -bias / gain
+        max_rates = gain * (1 - intercepts)
+        return max_rates, intercepts
+
+    def step_math(self, dt, J, output):
+        """Implement the rectification nonlinearity."""
+        output[...] = self.amplitude * np.maximum(0., J)
+
+
+class SpikingRectifiedLinear(RectifiedLinear):
+    """A rectified integrate and fire agent model.
+
+    Each agent is modeled as a rectified line. That is, the agent's activity
+    scales linearly with current, unless the current is less than zero, at
+    which point the neural activity will stay at zero. This is a spiking
+    version of the RectifiedLinear agent model.
+
+    Parameters
+    ----------
+    amplitude : float
+        Scaling factor on the agent output. Corresponds to the relative
+        amplitude of the output spikes of the agent.
+    """
+
+    probeable = ('spikes', 'voltage')
+
+    def rates(self, x, gain, bias):
+        """Use RectifiedLinear to determine rates."""
+
+        J = self.current(x, gain, bias)
+        out = np.zeros_like(J)
+        RectifiedLinear.step_math(self, dt=1., J=J, output=out)
+        return out
+
+    def step_math(self, dt, J, spiked, voltage):
+        """Implement the integrate and fire nonlinearity."""
+
+        voltage += np.maximum(J, 0) * dt
+        n_spikes = np.floor(voltage)
+        spiked[:] = self.amplitude * n_spikes / dt
+        voltage -= n_spikes
+
+
+class Sigmoid(AgentType):
+    """A agent model whose response curve is a sigmoid.
+
+    Since the tuning curves are strictly positive, the ``intercepts``
+    correspond to the inflection point of each sigmoid. That is,
+    ``f(intercept) = 0.5`` where ``f`` is the pure sigmoid function.
+    """
+
+    probeable = ('rates',)
+
+    tau_ref = NumberParam('tau_ref', low=0)
+
+    def __init__(self, tau_ref=0.0025):
+        super(Sigmoid, self).__init__()
+        self.tau_ref = tau_ref
+
+    @property
+    def _argreprs(self):
+        return [] if self.tau_ref == 0.0025 else ["tau_ref=%s" % self.tau_ref]
+
+    def gain_bias(self, max_rates, intercepts):
+        """Analytically determine gain, bias."""
+        max_rates = np.array(max_rates, dtype=float, copy=False, ndmin=1)
+        intercepts = np.array(intercepts, dtype=float, copy=False, ndmin=1)
+        lim = 1. / self.tau_ref
+        inverse = -np.log(lim / max_rates - 1.)
+        gain = inverse / (1. - intercepts)
+        bias = inverse - gain
+        return gain, bias
+
+    def max_rates_intercepts(self, gain, bias):
+        """Compute the inverse of gain_bias."""
+        inverse = gain + bias
+        intercepts = 1 - inverse / gain
+        lim = 1. / self.tau_ref
+        max_rates = lim / (1 + np.exp(-inverse))
+        return max_rates, intercepts
+
+    def step_math(self, dt, J, output):
+        """Implement the sigmoid nonlinearity."""
+        output[...] = (1. / self.tau_ref) / (1.0 + np.exp(-J))
+
+
 class LIFRate(AgentType):
     """Non-spiking version of the leaky integrate-and-fire (LIF) agent model.
 
@@ -223,10 +388,10 @@ class LIFRate(AgentType):
         if np.any(max_rates > inv_tau_ref):
             raise ValidationError("Max rates must be below the inverse "
                                   "refractory period (%0.3f)" % inv_tau_ref,
-        x = 1.0 / (1 - np.exp(
-            (self.tau_ref - (1.0 / max_rates)) / self.tau_rc))
                                   attr='max_rates', obj=self)
 
+        x = 1.0 / (1 - np.exp(
+            (self.tau_ref - (1.0 / max_rates)) / self.tau_rc))
         gain = (1 - x) / (intercepts - 1.0)
         bias = 1 - gain * intercepts
         return gain, bias
@@ -278,9 +443,9 @@ class LIF(LIFRate):
         amplitude of the output spikes of the agent.
     """
 
-    # probeable = ('spikes', 'voltage', 'refractory_time')
+    probeable = ('spikes', 'voltage', 'refractory_time')
 
-    # min_voltage = NumberParam('min_voltage', high=0)
+    min_voltage = NumberParam('min_voltage', high=0)
 
     def __init__(self, tau_rc=0.02, tau_ref=0.002, min_voltage=0, amplitude=1):
         super(LIF, self).__init__(
@@ -316,3 +481,205 @@ class LIF(LIFRate):
         voltage[spiked_mask] = 0
         refractory_time[spiked_mask] = self.tau_ref + t_spike
 
+
+class AdaptiveLIFRate(LIFRate):
+    """Adaptive non-spiking version of the LIF agent model.
+
+    Works as the LIF model, except with adapation state ``n``, which is
+    subtracted from the input current. Its dynamics are::
+
+        tau_n dn/dt = -n
+
+    where ``n`` is incremented by ``inc_n`` when the agent spikes.
+
+    Parameters
+    ----------
+    tau_n : float
+        Adaptation time constant. Affects how quickly the adaptation state
+        decays to zero in the absence of spikes (larger = slower decay).
+    inc_n : float
+        Adaptation increment. How much the adaptation state is increased after
+        each spike.
+    tau_rc : float
+        Membrane RC time constant, in seconds. Affects how quickly the membrane
+        voltage decays to zero in the absence of input (larger = slower decay).
+    tau_ref : float
+        Absolute refractory period, in seconds. This is how long the
+        membrane voltage is held at zero after a spike.
+
+    References
+    ----------
+    .. [1] Koch, Christof. Biophysics of Computation: Information Processing
+       in Single Agents. Oxford University Press, 1999. p. 339
+    """
+
+    probeable = ('rates', 'adaptation')
+
+    tau_n = NumberParam('tau_n', low=0, low_open=True)
+    inc_n = NumberParam('inc_n', low=0)
+
+    def __init__(self, tau_n=1, inc_n=0.01, **lif_args):
+        super(AdaptiveLIFRate, self).__init__(**lif_args)
+        self.tau_n = tau_n
+        self.inc_n = inc_n
+
+    @property
+    def _argreprs(self):
+        args = super(AdaptiveLIFRate, self)._argreprs
+        if self.tau_n != 1:
+            args.append("tau_n=%s" % self.tau_n)
+        if self.inc_n != 0.01:
+            args.append("inc_n=%s" % self.inc_n)
+        return args
+
+    def step_math(self, dt, J, output, adaptation):
+        """Implement the AdaptiveLIFRate nonlinearity."""
+        n = adaptation
+        LIFRate.step_math(self, dt, J - n, output)
+        n += (dt / self.tau_n) * (self.inc_n * output - n)
+
+
+class AdaptiveLIF(AdaptiveLIFRate, LIF):
+    """Adaptive spiking version of the LIF agent model.
+
+    Works as the LIF model, except with adapation state ``n``, which is
+    subtracted from the input current. Its dynamics are::
+
+        tau_n dn/dt = -n
+
+    where ``n`` is incremented by ``inc_n`` when the agent spikes.
+
+    Parameters
+    ----------
+    tau_n : float
+        Adaptation time constant. Affects how quickly the adaptation state
+        decays to zero in the absence of spikes (larger = slower decay).
+    inc_n : float
+        Adaptation increment. How much the adaptation state is increased after
+        each spike.
+    tau_rc : float
+        Membrane RC time constant, in seconds. Affects how quickly the membrane
+        voltage decays to zero in the absence of input (larger = slower decay).
+    tau_ref : float
+        Absolute refractory period, in seconds. This is how long the
+        membrane voltage is held at zero after a spike.
+
+    References
+    ----------
+    .. [1] Koch, Christof. Biophysics of Computation: Information Processing
+       in Single Agents. Oxford University Press, 1999. p. 339
+    """
+
+    probeable = ('spikes', 'adaptation', 'voltage', 'refractory_time')
+
+    def step_math(self, dt, J, output, voltage, ref, adaptation):
+        """Implement the AdaptiveLIF nonlinearity."""
+        n = adaptation
+        LIF.step_math(self, dt, J - n, output, voltage, ref)
+        n += (dt / self.tau_n) * (self.inc_n * output - n)
+
+
+class Izhikevich(AgentType):
+    """Izhikevich agent model.
+
+    This implementation is based on the original paper [1]_;
+    however, we rename some variables for clarity.
+    What was originally 'v' we term 'voltage', which represents the membrane
+    potential of each agent. What was originally 'u' we term 'recovery',
+    which represents membrane recovery, "which accounts for the activation
+    of K+ ionic currents and inactivation of Na+ ionic currents."
+    The 'a', 'b', 'c', and 'd' parameters are also renamed
+    (see the parameters below).
+
+    We use default values that correspond to regular spiking ('RS') agents.
+    For other classes of agents, set the parameters as follows.
+
+    * Intrinsically bursting (IB): ``reset_voltage=-55, reset_recovery=4``
+    * Chattering (CH): ``reset_voltage=-50, reset_recovery=2``
+    * Fast spiking (FS): ``tau_recovery=0.1``
+    * Low-threshold spiking (LTS): ``coupling=0.25``
+    * Resonator (RZ): ``tau_recovery=0.1, coupling=0.26``
+
+    Parameters
+    ----------
+    tau_recovery : float, optional (Default: 0.02)
+        (Originally 'a') Time scale of the recovery variable.
+    coupling : float, optional (Default: 0.2)
+        (Originally 'b') How sensitive recovery is to subthreshold
+        fluctuations of voltage.
+    reset_voltage : float, optional (Default: -65.)
+        (Originally 'c') The voltage to reset to after a spike, in millivolts.
+    reset_recovery : float, optional (Default: 8.)
+        (Originally 'd') The recovery value to reset to after a spike.
+
+    References
+    ----------
+    .. [1] E. M. Izhikevich, "Simple model of spiking agents."
+       IEEE Transactions on Neural Networks, vol. 14, no. 6, pp. 1569-1572.
+       (http://www.izhikevich.org/publications/spikes.pdf)
+    """
+
+    probeable = ('spikes', 'voltage', 'recovery')
+
+    tau_recovery = NumberParam('tau_recovery', low=0, low_open=True)
+    coupling = NumberParam('coupling', low=0)
+    reset_voltage = NumberParam('reset_voltage')
+    reset_recovery = NumberParam('reset_recovery')
+
+    def __init__(self, tau_recovery=0.02, coupling=0.2,
+                 reset_voltage=-65., reset_recovery=8.):
+        super(Izhikevich, self).__init__()
+        self.tau_recovery = tau_recovery
+        self.coupling = coupling
+        self.reset_voltage = reset_voltage
+        self.reset_recovery = reset_recovery
+
+    @property
+    def _argreprs(self):
+        args = []
+
+        def add(attr, default):
+            if getattr(self, attr) != default:
+                args.append("%s=%s" % (attr, getattr(self, attr)))
+        add("tau_recovery", 0.02)
+        add("coupling", 0.2)
+        add("reset_voltage", -65.)
+        add("reset_recovery", 8.)
+        return args
+
+    def rates(self, x, gain, bias):
+        """Estimates steady-state firing rate given gain and bias."""
+        J = self.current(x, gain, bias)
+        voltage = np.zeros_like(J)
+        recovery = np.zeros_like(J)
+        return settled_firingrate(self.step_math, J, [voltage, recovery],
+                                  settle_time=0.001, sim_time=1.0)
+
+    def step_math(self, dt, J, spiked, voltage, recovery):
+        """Implement the Izhikevich nonlinearity."""
+        # Numerical instability occurs for very low inputs.
+        # We'll clip them be greater than some value that was chosen by
+        # looking at the simulations for many parameter sets.
+        # A more principled minimum value would be better.
+        J = np.maximum(-30., J)
+
+        dV = (0.04 * voltage ** 2 + 5 * voltage + 140 - recovery + J) * 1000
+        voltage[:] += dV * dt
+
+        # We check for spikes and reset the voltage here rather than after,
+        # which differs from the original implementation by Izhikevich.
+        # However, calculating recovery for voltage values greater than
+        # threshold can cause the system to blow up, which we want
+        # to avoid at all costs.
+        spiked[:] = (voltage >= 30) / dt
+        voltage[spiked > 0] = self.reset_voltage
+
+        dU = (self.tau_recovery * (self.coupling * voltage - recovery)) * 1000
+        recovery[:] += dU * dt
+        recovery[spiked > 0] = recovery[spiked > 0] + self.reset_recovery
+
+
+class AgentTypeParam(Parameter):
+    def coerce(self, instance, agents):
+        self.check_type(instance, agents, AgentType)
+        return super(AgentTypeParam, self).coerce(instance, agents)
